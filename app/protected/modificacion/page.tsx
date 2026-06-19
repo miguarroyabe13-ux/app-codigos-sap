@@ -29,16 +29,15 @@ export default function ModificacionPage() {
     const [submitSuccess, setSubmitSuccess] = useState(false);
 
     const skuRef = useRef<HTMLDivElement>(null);
+    const fetchingRef = useRef(false);
+    const offsetRef = useRef(0);
 
     // Connection Check
     useEffect(() => {
         const checkConnection = async () => {
             try {
-                let { error } = await supabase.from("SAP_SKU").select("*").limit(1);
-                if (error) {
-                    let { error: e2 } = await supabase.from("SAP SKU").select("*").limit(1);
-                    if (!e2) setSkuTable("SAP SKU");
-                }
+                const res = await fetch("/api/sap/skus?limit=1");
+                if (!res.ok) throw new Error("SAP Connection failed");
                 setConnStatus("connected");
             } catch {
                 setConnStatus("error");
@@ -48,43 +47,50 @@ export default function ModificacionPage() {
     }, []);
 
     const performSearch = useCallback(async (value: string, isAppending = false) => {
-        const offset = isAppending ? skuResults.length : 0;
         const BATCH_SIZE = 100;
 
         if (!isAppending && value.trim().length > 0) {
             if (selectedSku?.SKU !== value && selectedSku?.DESCRIPCION !== value) setSelectedSku(null);
         }
 
+        // Reset or keep offset synchronously via ref
+        if (!isAppending) offsetRef.current = 0;
+        const offset = offsetRef.current;
+
         if (isAppending) setLoadingMore(true);
         else setLoading(true);
 
         try {
-            let query = supabase.from(skuTable).select("*");
-            if (value.trim().length > 0) {
-                const term = `%${value}%`;
-                query = query.or(`SKU.ilike.${term},DESCRIPCION.ilike.${term}`);
-            }
-            const { data, error } = await query.order("SKU", { ascending: true }).range(offset, offset + BATCH_SIZE - 1);
-            if (error) throw error;
+            const url = `/api/sap/skus?search=${encodeURIComponent(value)}&offset=${offset}&limit=${BATCH_SIZE}`;
+            const res = await fetch(url);
 
-            const newData = data || [];
-            setHasMore(newData.length === BATCH_SIZE);
-
-            if (isAppending) {
-                setSkuResults(prev => {
-                    const combined = [...prev, ...newData];
-                    return Array.from(new Map(combined.map(item => [item.SKU || Math.random(), item])).values());
-                });
-            } else {
-                setSkuResults(Array.from(new Map(newData.map(item => [item.SKU || Math.random(), item])).values()));
+            if (!res.ok) {
+                const errData = await res.json().catch(() => ({}));
+                throw new Error(errData.error || "Error fetching SAP data");
             }
+
+            const resData = await res.json();
+            const newData: any[] = resData.data || [];
+
+            // Advance offset
+            offsetRef.current += newData.length;
+
+            setHasMore(resData.hasMore);
+
+            const appendData = isAppending;
+            setSkuResults((prev: any[]) => {
+                const arr = appendData ? [...prev, ...newData] : newData;
+                return Array.from(new Map(arr.map((item: any) => [item.SKU ?? Math.random(), item])).values());
+            });
+
         } catch (err: any) {
             setDetailedError(err.message);
         } finally {
+            fetchingRef.current = false;
             if (isAppending) setLoadingMore(false);
             else setLoading(false);
         }
-    }, [skuTable, skuResults, selectedSku]);
+    }, [selectedSku]);
 
     useEffect(() => {
         if (activeField === "sku") {
@@ -111,7 +117,8 @@ export default function ModificacionPage() {
 
     const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
         const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
-        if (scrollHeight - scrollTop <= clientHeight + 100 && !loadingMore && hasMore) {
+        if (scrollHeight - scrollTop <= clientHeight + 100 && !fetchingRef.current && hasMore) {
+            fetchingRef.current = true;
             performSearch(skuInput, true);
         }
     };

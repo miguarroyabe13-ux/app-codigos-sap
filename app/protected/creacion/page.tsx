@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronLeft, PlusCircle, Package, Copy, Search, Loader2, ChevronRight, Bug, Database, XCircle, Trash2, CheckCircle2 } from "lucide-react";
+import { ChevronLeft, PlusCircle, Package, Copy, Search, Loader2, ChevronRight, Bug, Database, XCircle, Trash2, CheckCircle2, AlertTriangle } from "lucide-react";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { createClient } from "@/lib/supabase/client";
 
@@ -43,6 +43,9 @@ export default function CreacionPage() {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [submitSuccess, setSubmitSuccess] = useState(false);
 
+    // Kit compatibility error toast
+    const [kitCompatError, setKitCompatError] = useState<string | null>(null);
+
     // Pagination States
     const [hasMore, setHasMore] = useState<Record<string, boolean>>({ sku: true, color: true, version: true, kit_sku: true });
 
@@ -57,20 +60,16 @@ export default function CreacionPage() {
     const versionRef = useRef<HTMLDivElement>(null);
     const kitRef = useRef<HTMLDivElement>(null);
 
+    // Sync Refs for scroll lock and offset tracking (avoids stale closures entirely)
+    const fetchingRef = useRef<Record<string, boolean>>({ sku: false, color: false, version: false, kit_sku: false });
+    const offsetRef = useRef<Record<string, number>>({ sku: 0, color: 0, version: 0, kit_sku: 0 });
+
     // Connection Check & Table Detection
     useEffect(() => {
         const checkConnection = async () => {
             try {
-                let { error: colorErr } = await supabase.from("BD_ COLORES_GRUPOS").select("Articulo").limit(1);
-                if (colorErr) {
-                    let { error: colorErr2 } = await supabase.from("BD_COLORES_GRUPOS").select("Articulo").limit(1);
-                    if (!colorErr2) setActiveColoresTable("BD_COLORES_GRUPOS");
-                }
-                let { error: skuErr } = await supabase.from("SAP_SKU").select("*").limit(1);
-                if (skuErr) {
-                    let { error: skuErr2 } = await supabase.from("SAP SKU").select("*").limit(1);
-                    if (!skuErr2) setSkuTable("SAP SKU");
-                }
+                const res = await fetch("/api/sap/skus?limit=1");
+                if (!res.ok) throw new Error("SAP Connection failed");
                 setConnStatus("connected");
             } catch (err: any) {
                 setConnStatus("error");
@@ -79,119 +78,94 @@ export default function CreacionPage() {
         checkConnection();
     }, []);
 
-    // Individual Search Handler (High Capacity & Infinite Scroll)
     const performSearch = useCallback(async (field: ActiveField, value: string, isAppending = false) => {
-        if (!field) return;
+        if (!field || fetchingRef.current[field]) return;
+        fetchingRef.current[field] = true;
 
-        // Clear selection only if manual typing (value doesn't match selected code or name)
         if (!isAppending && value.trim().length > 0) {
             if (field === "sku" && (selectedSku?.SKU !== value && selectedSku?.DESCRIPCION !== value)) setSelectedSku(null);
             else if (field === "color" && (selectedColor?.Color !== value && selectedColor?.CodigoColor !== value)) setSelectedColor(null);
             else if (field === "version" && (selectedVersion?.Version !== value && selectedVersion?.CodigoVersion !== value)) setSelectedVersion(null);
         }
 
-        const currentData = field === "sku" ? skuResults : field === "color" ? colorResults : field === "kit_sku" ? kitResults : versionResults;
-        const offset = isAppending ? currentData.length : 0;
-        const BATCH_SIZE = 100; // Increased capacity
+        const BATCH_SIZE = 100;
+
+        // Reset offset on new search, keep it for appending
+        if (!isAppending) {
+            offsetRef.current[field] = 0;
+        }
+
+        // Synchronously grab the current offset from ref — no stale closure possible
+        const offset = offsetRef.current[field];
 
         if (isAppending) setLoadingMore(prev => ({ ...prev, [field]: true }));
         else setLoading(prev => ({ ...prev, [field]: true }));
 
         try {
-            let table = (field === "sku" || field === "kit_sku") ? skuTable : activeColoresTable;
-
-            // EXACT VERIFIED COLUMNS
-            let columnsToSearch = [];
+            let endpoint = "";
             let displayCodeCol = "";
-            let displayNameCol = "";
-            let orderByCol = "";
 
             if (field === "sku" || field === "kit_sku") {
-                columnsToSearch = ["SKU", "DESCRIPCION"];
+                endpoint = "/api/sap/skus";
                 displayCodeCol = "SKU";
-                displayNameCol = "DESCRIPCION";
-                orderByCol = "SKU";
             } else if (field === "color") {
-                columnsToSearch = ["CodigoColor", "Color"];
+                endpoint = "/api/sap/colores";
                 displayCodeCol = "CodigoColor";
-                displayNameCol = "Color";
-                orderByCol = "CodigoColor";
             } else {
-                columnsToSearch = ["CodigoVersion", "Version"];
+                endpoint = "/api/sap/versiones";
                 displayCodeCol = "CodigoVersion";
-                displayNameCol = "Version";
-                orderByCol = "CodigoVersion";
             }
 
-            let query = supabase.from(table).select("*");
+            const url = `${endpoint}?search=${encodeURIComponent(value)}&offset=${offset}&limit=${BATCH_SIZE}`;
+            const res = await fetch(url);
 
-            if (value.trim().length > 0) {
-                const term = `%${value}%`;
-                query = query.or(columnsToSearch.map(col => `${col}.ilike.${term}`).join(","));
+            if (!res.ok) {
+                const errData = await res.json().catch(() => ({}));
+                throw new Error(errData.error || "Error fetching SAP data");
             }
 
-            // High capacity fetching
-            let { data, error } = await query
-                .order(orderByCol, { ascending: true })
-                .range(offset, offset + BATCH_SIZE - 1);
+            const resData = await res.json();
+            const newData: any[] = resData.data || [];
 
-            if (error) throw error;
+            // Advance the offset ref by how many items we got
+            offsetRef.current[field] += newData.length;
 
-            const newData = data || [];
-            setHasMore(prev => ({ ...prev, [field]: newData.length === BATCH_SIZE }));
+            setHasMore(prev => ({ ...prev, [field]: resData.hasMore }));
 
-            if (isAppending) {
-                const combined = [...currentData, ...newData];
-                const unique = Array.from(new Map(combined.map(item => [item[displayCodeCol] || Math.random(), item])).values());
-                if (field === "sku") setSkuResults(unique);
-                else if (field === "color") setColorResults(unique);
-                else if (field === "version") setVersionResults(unique);
-                else if (field === "kit_sku") setKitResults(unique);
-            } else {
-                const unique = Array.from(new Map(newData.map(item => [item[displayCodeCol] || Math.random(), item])).values());
-                if (field === "sku") setSkuResults(unique);
-                else if (field === "color") setColorResults(unique);
-                else if (field === "version") setVersionResults(unique);
-                else if (field === "kit_sku") setKitResults(unique);
-            }
+            const displayCol = displayCodeCol;
+            const appendData = isAppending;
+            const updateList = (prev: any[]) => {
+                const arr = appendData ? [...prev, ...newData] : newData;
+                return Array.from(new Map(arr.map((item: any) => [item[displayCol] ?? Math.random(), item])).values());
+            };
+
+            if (field === "sku") setSkuResults(updateList);
+            else if (field === "color") setColorResults(updateList);
+            else if (field === "version") setVersionResults(updateList);
+            else if (field === "kit_sku") setKitResults(updateList);
 
         } catch (err: any) {
             console.error("Search Error:", err);
             setDetailedError(err.message);
         } finally {
+            fetchingRef.current[field] = false;
             if (isAppending) setLoadingMore(prev => ({ ...prev, [field]: false }));
             else setLoading(prev => ({ ...prev, [field]: false }));
         }
-    }, [activeColoresTable, skuTable, skuResults, colorResults, versionResults, kitResults]);
+    }, [selectedSku, selectedColor, selectedVersion]);
 
-    // Typing effects
+    // Consolidated typing effect with concurrency protection
     useEffect(() => {
-        if (activeField === "sku") {
-            const timer = setTimeout(() => performSearch("sku", skuInput), 300);
+        if (activeField && !fetchingRef.current[activeField]) {
+            const val = activeField === "sku" ? skuInput : 
+                        activeField === "color" ? colorInput : 
+                        activeField === "kit_sku" ? kitInput : versionInput;
+            const timer = setTimeout(() => {
+                performSearch(activeField, val);
+            }, 300);
             return () => clearTimeout(timer);
         }
-    }, [skuInput, activeField]);
-
-    useEffect(() => {
-        if (activeField === "color") {
-            const timer = setTimeout(() => performSearch("color", colorInput), 300);
-            return () => clearTimeout(timer);
-        }
-    }, [colorInput, activeField]);
-
-    useEffect(() => {
-        if (activeField === "version") {
-            const timer = setTimeout(() => performSearch("version", versionInput), 300);
-            return () => clearTimeout(timer);
-        }
-    }, [versionInput, activeField]);
-
-    useEffect(() => {
-        if (activeField === "kit_sku") {
-            const timer = setTimeout(() => performSearch("kit_sku", kitInput), 300);
-            return () => clearTimeout(timer);
-        }
-    }, [kitInput, activeField]);
+    }, [skuInput, colorInput, kitInput, versionInput, activeField, performSearch]);
 
     const handleFocus = (field: ActiveField) => {
         if (field !== "sku") setSkuResults([]);
@@ -206,7 +180,9 @@ export default function CreacionPage() {
 
     const handleScroll = (e: React.UIEvent<HTMLDivElement>, field: ActiveField) => {
         const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
-        if (scrollHeight - scrollTop <= clientHeight + 100 && !loadingMore[field as string] && hasMore[field as string]) {
+        const fieldKey = field as string;
+        if (scrollHeight - scrollTop <= clientHeight + 100 && !fetchingRef.current[fieldKey] && hasMore[fieldKey]) {
+            fetchingRef.current[fieldKey] = true;
             const val = field === "sku" ? skuInput : field === "color" ? colorInput : field === "kit_sku" ? kitInput : versionInput;
             performSearch(field, val, true);
         }
@@ -268,6 +244,82 @@ export default function CreacionPage() {
         }
     };
 
+        const validateKitCompatibility = (newItem: any, currentItems: any[]) => {
+            const getDetails = (item: any) => {
+                const raw = (item.DESCRIPCION || item.ItemName || "").toUpperCase()
+                    .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                const sku = (item.SKU || item.ItemCode || "").toUpperCase();
+
+                console.log("[KIT VALIDATE]", sku, "→", raw);
+
+                const isMueble = raw.includes("MUE") || raw.includes("GABINETE") || raw.includes("VANITY") || sku.startsWith("MUE");
+                const isLavamanos = raw.includes("LAVA") || raw.includes("LAVAB") || raw.includes("BASIN") || raw.includes("SINK") || sku.startsWith("LAV");
+                const isEspejo = raw.includes("ESPEJO") || raw.includes("MIRROR") || sku.startsWith("ESP");
+                const isVessel = raw.includes("VESSEL") || raw.includes("SOBREPONER");
+
+                const dimMatch = raw.match(/(\d{2,3})\s*[Xx*]\s*(\d{2,3})/);
+                const dimension = dimMatch ? `${dimMatch[1]}X${dimMatch[2]}` : null;
+
+                // Extraer prefijo de familia del SKU (ej: CACC01, MAQYEQ, etc.)
+                const familyPrefix = sku.split(/\d/)[0] || sku.substring(0, 6);
+
+                return { isMueble, isLavamanos, isEspejo, dimension, isVessel, raw, sku, familyPrefix };
+            };
+
+            if (currentItems.length === 0) return null;
+
+            const newDetails = getDetails(newItem);
+            console.log("[KIT VALIDATE] Detectado:", { isMueble: newDetails.isMueble, isLavamanos: newDetails.isLavamanos, dimension: newDetails.dimension, familia: newDetails.familyPrefix });
+
+            for (const item of currentItems) {
+                const currDetails = getDetails(item);
+
+                // Regla 1: Mueble + Lavamanos → misma medida obligatoria
+                const isMuebleLavaPair =
+                    (newDetails.isMueble && currDetails.isLavamanos) ||
+                    (newDetails.isLavamanos && currDetails.isMueble);
+
+                if (isMuebleLavaPair && newDetails.dimension && currDetails.dimension && newDetails.dimension !== currDetails.dimension) {
+                    return `Las medidas no coinciden según el catálogo Firplak.\n\nArtículo nuevo: ${newDetails.sku} (${newDetails.dimension})\nArtículo en kit: ${currDetails.sku} (${currDetails.dimension})\n\nEl mueble y el lavamanos deben tener el mismo ancho × fondo.`;
+                }
+
+                // Regla 2: Vessel requiere mueble con cubierta plana
+                const isVesselMueblePair =
+                    (newDetails.isVessel && currDetails.isMueble) ||
+                    (currDetails.isVessel && newDetails.isMueble);
+
+                if (isVesselMueblePair) {
+                    const muebleRaw = newDetails.isMueble ? newDetails.raw : currDetails.raw;
+                    const muebleSku = newDetails.isMueble ? newDetails.sku : currDetails.sku;
+                    if (!muebleRaw.includes("PLANO") && !muebleRaw.includes("CUBIERTA") && !muebleRaw.includes("FLAT")) {
+                        return `El lavamanos tipo Vessel requiere un mueble con cubierta plana.\n\nEl mueble (${muebleSku}) no parece tener cubierta plana según su descripción.`;
+                    }
+                }
+
+                // Regla 3: Familias de SKU incompatibles (ej: baño vs maquinaria)
+                if (newDetails.familyPrefix && currDetails.familyPrefix && newDetails.familyPrefix !== currDetails.familyPrefix) {
+                    return `Los artículos pertenecen a familias de productos diferentes y no son compatibles en un kit.\n\n"${newDetails.sku}" → familia: ${newDetails.familyPrefix}\n"${currDetails.sku}" → familia: ${currDetails.familyPrefix}\n\nUn kit solo debe contener artículos de la misma familia de productos.`;
+                }
+
+                // Regla 4: Dos lavamanos con medidas diferentes → incompatible
+                if (newDetails.isLavamanos && currDetails.isLavamanos) {
+                    if (newDetails.dimension && currDetails.dimension && newDetails.dimension !== currDetails.dimension) {
+                        return `No se pueden combinar dos lavamanos con medidas diferentes en el mismo kit.\n\nLavamanos existente: ${currDetails.sku} (${currDetails.dimension})\nLavamanos nuevo: ${newDetails.sku} (${newDetails.dimension})\n\nUn kit de baño debe tener lavamanos de la misma referencia dimensional.`;
+                    }
+                    // Mismo tipo, misma medida: permitido (ej: kit doble)
+                }
+
+                // Regla 5: Dos muebles con medidas diferentes → incompatible
+                if (newDetails.isMueble && currDetails.isMueble) {
+                    if (newDetails.dimension && currDetails.dimension && newDetails.dimension !== currDetails.dimension) {
+                        return `No se pueden combinar dos muebles con medidas diferentes en el mismo kit.\n\nMueble existente: ${currDetails.sku} (${currDetails.dimension})\nMueble nuevo: ${newDetails.sku} (${newDetails.dimension})\n\nUn kit de baño debe tener muebles de la misma referencia dimensional.`;
+                    }
+                }
+            }
+
+            return null;
+        };
+
         const handleSelect = (field: ActiveField, item: any) => {
             if (field === "sku") {
                 setSkuInput(item.SKU);
@@ -280,10 +332,22 @@ export default function CreacionPage() {
                 setSelectedVersion(item);
             } else if (field === "kit_sku") {
                 // Prevent duplicates
-                setKitSelectedItems(prev => {
-                    if (prev.some(i => i.SKU === item.SKU)) return prev;
-                    return [...prev, item];
-                });
+                if (kitSelectedItems.some(i => i.SKU === item.SKU)) {
+                    setKitInput("");
+                    setKitResults([]);
+                    setActiveField(null);
+                    return;
+                }
+
+                // Check compatibility rules based on Firplak Catalog
+                const compatibilityError = validateKitCompatibility(item, kitSelectedItems);
+                if (compatibilityError) {
+                    setKitCompatError(compatibilityError);
+                    setTimeout(() => setKitCompatError(null), 6000);
+                    return; // Stop adding if incompatible
+                }
+
+                setKitSelectedItems(prev => [...prev, item]);
                 setKitInput("");
                 setKitResults([]);
             }
@@ -552,6 +616,27 @@ export default function CreacionPage() {
                             <div className="space-y-12 animate-in slide-in-from-bottom-8 duration-500">
                                 {/* Kit Article Search */}
                                 <div className="relative space-y-4" ref={kitRef}>
+                                    {/* ── Compatibility Error Toast ── */}
+                                    {kitCompatError && (
+                                        <div className="animate-in slide-in-from-top-4 fade-in duration-500 mb-4 flex items-start gap-4 p-6 bg-red-50 border-2 border-red-300 rounded-2xl shadow-lg relative">
+                                            <div className="shrink-0 w-12 h-12 rounded-xl bg-red-100 flex items-center justify-center">
+                                                <AlertTriangle className="w-7 h-7 text-red-500" />
+                                            </div>
+                                            <div className="flex-1 min-w-0">
+                                                <p className="text-red-700 font-black text-[0.85rem] uppercase tracking-wide mb-1">🚨 Artículo Incompatible</p>
+                                                <p className="text-red-600 font-medium text-[0.82rem] leading-relaxed whitespace-pre-line">{kitCompatError}</p>
+                                            </div>
+                                            <button
+                                                onClick={() => setKitCompatError(null)}
+                                                className="shrink-0 p-2 text-red-400 hover:text-red-600 hover:bg-red-100 rounded-xl transition-all"
+                                            >
+                                                <XCircle className="w-5 h-5" />
+                                            </button>
+                                            {/* Progress bar auto-close */}
+                                            <div className="absolute bottom-0 left-0 h-1 bg-red-300 rounded-b-2xl animate-[shrink_6s_linear_forwards]" style={{ width: '100%' }} />
+                                        </div>
+                                    )}
+
                                     <label className="text-[#64748B] font-bold text-[1rem] ml-2">Añadir Artículo al Kit</label>
                                     <div className={`relative transition-all duration-700 ${activeField === 'kit_sku' ? 'scale-[1.02] z-[201]' : 'z-10'}`}>
                                         <input
